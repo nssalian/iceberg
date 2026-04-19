@@ -1,0 +1,185 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Iceberg Baseline Benchmark Module
+//
+// Usage:
+//   ./gradlew :iceberg-benchmark:generateData -DsparkVersions=4.1 -DflinkVersions= -DscalaVersion=2.13 -Dbench.scale=small
+//   ./gradlew :iceberg-benchmark:sparkBench -DsparkVersions=4.1 -DflinkVersions= -DscalaVersion=2.13
+//   ./gradlew :iceberg-benchmark:flinkBatchBench -DsparkVersions= -DflinkVersions=2.0 -DscalaVersion=2.13
+//   ./gradlew :iceberg-benchmark:flinkStreamBench -DsparkVersions= -DflinkVersions=2.0 -DscalaVersion=2.13
+
+String scalaVersion = '2.13'
+String sparkMajorVersion = '4.1'
+String flinkMajorVersion = '1.20'
+
+def sparkVersions = System.getProperty("sparkVersions") != null ? System.getProperty("sparkVersions") : System.getProperty("defaultSparkVersions")
+def flinkVersions = System.getProperty("flinkVersions") != null ? System.getProperty("flinkVersions") : System.getProperty("defaultFlinkVersions")
+def hasSpark = sparkVersions != null && sparkVersions.contains(sparkMajorVersion)
+def hasFlink = flinkVersions != null && flinkVersions.contains(flinkMajorVersion)
+
+// Exclude engine-specific sources when that engine isn't on the classpath
+sourceSets {
+  main {
+    java {
+      if (!hasSpark) {
+        exclude '**/SparkBenchDriver.java'
+        exclude '**/DataGenerator.java'
+      }
+      if (!hasFlink) {
+        exclude '**/FlinkBatchBenchDriver.java'
+        exclude '**/FlinkStreamBenchDriver.java'
+      }
+    }
+  }
+}
+
+// Separate runtime configurations for each engine to avoid classpath conflicts
+configurations {
+  if (hasSpark) {
+    sparkRuntime {
+      extendsFrom implementation
+    }
+  }
+  if (hasFlink) {
+    flinkRuntime {
+      extendsFrom implementation
+    }
+  }
+}
+
+dependencies {
+  // Shared Iceberg dependencies (always on classpath)
+  implementation project(':iceberg-api')
+  implementation project(':iceberg-core')
+  implementation project(':iceberg-data')
+  implementation project(':iceberg-parquet')
+  implementation project(':iceberg-orc')
+  implementation project(':iceberg-common')
+  implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
+
+  if (hasSpark) {
+    // Spark - compile only so Flink tasks don't pull Spark classes
+    compileOnly project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}")
+    compileOnly project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVersion}")
+    compileOnly("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark41.get()}") {
+      exclude group: 'org.apache.avro', module: 'avro'
+      exclude group: 'org.apache.arrow'
+      exclude group: 'org.apache.parquet'
+      exclude group: 'org.roaringbitmap'
+    }
+
+    // Spark runtime classpath
+    sparkRuntime project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}")
+    sparkRuntime project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVersion}")
+    sparkRuntime("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark41.get()}") {
+      exclude group: 'org.apache.avro', module: 'avro'
+      exclude group: 'org.apache.arrow'
+      exclude group: 'org.apache.parquet'
+      exclude group: 'org.roaringbitmap'
+    }
+    sparkRuntime libs.parquet.column
+    sparkRuntime libs.parquet.hadoop
+  }
+
+  if (hasFlink) {
+    String flinkScala = '2.12'
+    // Flink - compile only so Spark tasks don't pull Flink classes
+    compileOnly project(":iceberg-flink:iceberg-flink-${flinkMajorVersion}")
+    compileOnly("org.apache.flink:flink-streaming-java:${libs.versions.flink120.get()}")
+    compileOnly("org.apache.flink:flink-table-api-java-bridge:${libs.versions.flink120.get()}")
+    compileOnly("org.apache.flink:flink-connector-files:${libs.versions.flink120.get()}")
+    compileOnly("org.apache.flink:flink-table-planner_${flinkScala}:${libs.versions.flink120.get()}")
+    compileOnly("org.apache.flink:flink-runtime:${libs.versions.flink120.get()}")
+
+    // Flink runtime classpath - use full planner (not loader) to avoid missing flink-table-runtime
+    flinkRuntime project(":iceberg-flink:iceberg-flink-${flinkMajorVersion}")
+    flinkRuntime("org.apache.flink:flink-streaming-java:${libs.versions.flink120.get()}")
+    flinkRuntime("org.apache.flink:flink-table-api-java-bridge:${libs.versions.flink120.get()}")
+    flinkRuntime("org.apache.flink:flink-connector-files:${libs.versions.flink120.get()}")
+    flinkRuntime("org.apache.flink:flink-table-planner_${flinkScala}:${libs.versions.flink120.get()}")
+    flinkRuntime("org.apache.flink:flink-runtime:${libs.versions.flink120.get()}")
+    flinkRuntime("org.apache.flink:flink-clients:${libs.versions.flink120.get()}")
+    flinkRuntime libs.hadoop3.client
+    flinkRuntime("org.apache.flink:flink-sql-parquet:${libs.versions.flink120.get()}")
+    flinkRuntime libs.flink120.metrics.dropwizard
+  }
+}
+
+// Forward all -Dbench.* system properties to the forked JVM
+def benchSysProps() {
+  def props = [:]
+  System.properties.each { key, value ->
+    if (key.startsWith('bench.')) {
+      props[key] = value
+    }
+  }
+  return props
+}
+
+// --- Data Generation (uses Spark) ---
+if (hasSpark) {
+  task generateData(type: JavaExec) {
+    group = 'benchmark'
+    description = 'Generate benchmark datasets (events, orders, CDC batches)'
+    mainClass = 'org.apache.iceberg.benchmark.DataGenerator'
+    classpath = sourceSets.main.output + configurations.sparkRuntime
+    jvmArgs = ['-Xmx16g', '-XX:+UseG1GC'] + project.property('extraJvmArgs')
+    systemProperties = benchSysProps()
+    if (!systemProperties.containsKey('bench.scale')) {
+      systemProperties['bench.scale'] = 'small'
+    }
+    if (!systemProperties.containsKey('bench.staging')) {
+      systemProperties['bench.staging'] = '/tmp/iceberg-bench/staging'
+    }
+  }
+
+  task sparkBench(type: JavaExec) {
+    group = 'benchmark'
+    description = 'Run Spark benchmark (writes, reads, CDC, maintenance)'
+    mainClass = 'org.apache.iceberg.benchmark.SparkBenchDriver'
+    classpath = sourceSets.main.output + configurations.sparkRuntime
+    jvmArgs = ['-Xmx16g', '-XX:+UseG1GC'] + project.property('extraJvmArgs')
+    systemProperties = benchSysProps()
+  }
+}
+
+// --- Flink Benchmarks ---
+if (hasFlink) {
+  task flinkBatchBench(type: JavaExec) {
+    group = 'benchmark'
+    description = 'Run Flink batch benchmark (writes, reads)'
+    mainClass = 'org.apache.iceberg.benchmark.FlinkBatchBenchDriver'
+    classpath = sourceSets.main.output + configurations.flinkRuntime
+    jvmArgs = ['-Xmx16g', '-XX:+UseG1GC'] + project.property('extraJvmArgs')
+    systemProperties = benchSysProps()
+  }
+
+  task flinkStreamBench(type: JavaExec) {
+    group = 'benchmark'
+    description = 'Run Flink streaming benchmark (streaming writes, CDC changelog)'
+    mainClass = 'org.apache.iceberg.benchmark.FlinkStreamBenchDriver'
+    classpath = sourceSets.main.output + configurations.flinkRuntime
+    jvmArgs = ['-Xmx16g', '-XX:+UseG1GC'] + project.property('extraJvmArgs')
+    systemProperties = benchSysProps()
+  }
+}
+
+// Disable checkstyle for benchmark code - it's a tool, not production code
+tasks.withType(Checkstyle).configureEach { enabled = false }

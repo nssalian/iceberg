@@ -40,6 +40,7 @@ spark/v4.0/spark-extensions/benchmark/*
 spark/v4.1/spark/benchmark/*
 spark/v4.1/spark-extensions/benchmark/*
 */benchmark/*
+benchmark/runs/
 
 __pycache__/
 *.py[cod]
