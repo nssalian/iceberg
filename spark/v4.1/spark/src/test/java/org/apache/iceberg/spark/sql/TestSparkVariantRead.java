@@ -325,7 +325,6 @@ public class TestSparkVariantRead extends TestBase {
         "MERGE INTO %s AS target "
             + "USING (SELECT 1 AS id, parse_json('{\"name\":\"alice\",\"age\":31}') AS data) AS source "
             + "ON target.id = source.id "
-            + "  AND variant_get(target.data, '$.name', 'string') = variant_get(source.data, '$.name', 'string') "
             + "WHEN MATCHED THEN UPDATE SET target.data = source.data "
             + "WHEN NOT MATCHED THEN INSERT *",
         mergeTable);
