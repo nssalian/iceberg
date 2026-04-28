@@ -35,16 +35,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.stream.IntStream;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.MetricsModes;
 import org.apache.iceberg.MetricsModes.MetricsMode;
+import org.apache.iceberg.PartitionData;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TestTables;
 import org.apache.iceberg.deletes.EqualityDeleteWriter;
@@ -57,6 +62,7 @@ import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.formats.FileWriterBuilder;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
@@ -88,6 +94,8 @@ public abstract class BaseFormatModelTests<T> {
 
   protected abstract void assertEquals(Schema schema, List<T> expected, List<T> actual);
 
+  protected abstract Object convertConstantToEngine(Type type, Object value);
+
   protected boolean supportsBatchReads() {
     return false;
   }
@@ -108,7 +116,9 @@ public abstract class BaseFormatModelTests<T> {
   static final String FEATURE_FILTER = "filter";
   static final String FEATURE_CASE_SENSITIVE = "caseSensitive";
   static final String FEATURE_SPLIT = "split";
+  static final String FEATURE_READER_DEFAULT = "readerDefault";
   static final String FEATURE_REUSE_CONTAINERS = "reuseContainers";
+  static final String FEATURE_META_ROW_LINEAGE = "metaRowLineage";
   static final String FEATURE_COLUMN_LEVEL_METRICS = "columnLevelMetrics";
   static final String FEATURE_COLUMN_METRICS_TRUNCATE_BINARY = "columnMetricsTruncateBinary";
 
@@ -123,7 +133,12 @@ public abstract class BaseFormatModelTests<T> {
             FEATURE_COLUMN_METRICS_TRUNCATE_BINARY
           },
           FileFormat.ORC,
-          new String[] {FEATURE_REUSE_CONTAINERS, FEATURE_COLUMN_METRICS_TRUNCATE_BINARY});
+          new String[] {
+            FEATURE_REUSE_CONTAINERS,
+            FEATURE_COLUMN_METRICS_TRUNCATE_BINARY,
+            FEATURE_META_ROW_LINEAGE,
+            FEATURE_READER_DEFAULT
+          });
 
   private InMemoryFileIO fileIO;
   private EncryptedOutputFile encryptedFile;
@@ -395,7 +410,10 @@ public abstract class BaseFormatModelTests<T> {
     List<Record> genericRecords = dataGenerator.generateRecords();
     writeGenericRecords(fileFormat, fullSchema, genericRecords);
 
-    List<Record> projectedGenericRecords = projectRecords(genericRecords, projectedSchema);
+    List<Record> projectedGenericRecords =
+        genericRecords.stream()
+            .map(record -> copy(record, projectedSchema, projectedSchema))
+            .toList();
     List<T> expectedEngineRecords =
         convertToEngineRecords(projectedGenericRecords, projectedSchema);
 
@@ -615,6 +633,50 @@ public abstract class BaseFormatModelTests<T> {
     }
 
     reuseRecords.forEach(r -> assertThat(r).isSameAs(reuseRecords.get(0)));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReaderSchemaEvolutionNewColumnWithDefault(FileFormat fileFormat) throws IOException {
+
+    assumeSupports(fileFormat, FEATURE_READER_DEFAULT);
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema writeSchema = dataGenerator.schema();
+
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, writeSchema, genericRecords);
+
+    String defaultStringValue = "default_value";
+    int defaultIntValue = 42;
+
+    int maxFieldId =
+        writeSchema.columns().stream().mapToInt(Types.NestedField::fieldId).max().orElse(0);
+
+    List<Types.NestedField> evolvedColumns = Lists.newArrayList(writeSchema.columns());
+    evolvedColumns.add(
+        Types.NestedField.required("col_f")
+            .withId(maxFieldId + 1)
+            .ofType(Types.StringType.get())
+            .withInitialDefault(Literal.of(defaultStringValue))
+            .build());
+    evolvedColumns.add(
+        Types.NestedField.optional("col_g")
+            .withId(maxFieldId + 2)
+            .ofType(Types.IntegerType.get())
+            .withInitialDefault(Literal.of(defaultIntValue))
+            .build());
+
+    Schema evolvedSchema = new Schema(evolvedColumns);
+    readAndAssertGenericRecords(
+        fileFormat,
+        evolvedSchema,
+        genericRecords,
+        record -> {
+          Record expected = copy(record, writeSchema, evolvedSchema);
+          expected.setField("col_f", defaultStringValue);
+          expected.setField("col_g", defaultIntValue);
+          return expected;
+        });
   }
 
   @ParameterizedTest
@@ -903,6 +965,371 @@ public abstract class BaseFormatModelTests<T> {
     assertBounds(fileFormat, schema, records, dataFile);
   }
 
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnFilePath(FileFormat fileFormat) throws IOException {
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema schema = dataGenerator.schema();
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, schema, genericRecords);
+
+    String filePath = "test-data-file.parquet";
+    Schema projectionSchema = new Schema(MetadataColumns.FILE_PATH);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(MetadataColumns.FILE_PATH.fieldId(), filePath);
+
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        genericRecords,
+        ignored ->
+            GenericRecord.create(projectionSchema)
+                .copy(MetadataColumns.FILE_PATH.name(), filePath));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnSpecId(FileFormat fileFormat) throws IOException {
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema schema = dataGenerator.schema();
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, schema, genericRecords);
+
+    int specId = 0;
+    Schema projectionSchema = new Schema(MetadataColumns.SPEC_ID);
+
+    Map<Integer, Object> idToConstant = ImmutableMap.of(MetadataColumns.SPEC_ID.fieldId(), specId);
+
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        genericRecords,
+        ignored ->
+            GenericRecord.create(projectionSchema).copy(MetadataColumns.SPEC_ID.name(), specId));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnRowPosition(FileFormat fileFormat) throws IOException {
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema schema = dataGenerator.schema();
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, schema, genericRecords);
+
+    Schema projectionSchema = new Schema(MetadataColumns.ROW_POSITION);
+
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        null,
+        genericRecords,
+        (position, ignored) ->
+            GenericRecord.create(projectionSchema)
+                .copy(MetadataColumns.ROW_POSITION.name(), (long) position));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnIsDeleted(FileFormat fileFormat) throws IOException {
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema schema = dataGenerator.schema();
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, schema, genericRecords);
+
+    Schema projectionSchema = new Schema(MetadataColumns.IS_DELETED);
+
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        null,
+        genericRecords,
+        ignored ->
+            GenericRecord.create(projectionSchema).copy(MetadataColumns.IS_DELETED.name(), false));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnRowLinage(FileFormat fileFormat) throws IOException {
+    assumeSupports(fileFormat, FEATURE_META_ROW_LINEAGE);
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema schema = dataGenerator.schema();
+    List<Record> genericRecords = dataGenerator.generateRecords();
+    writeGenericRecords(fileFormat, schema, genericRecords);
+
+    long baseRowId = 100L;
+    long fileSeqNumber = 5L;
+    Schema projectionSchema =
+        new Schema(MetadataColumns.ROW_ID, MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(
+            MetadataColumns.ROW_ID.fieldId(), baseRowId,
+            MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId(), fileSeqNumber);
+
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        genericRecords,
+        (position, ignored) ->
+            GenericRecord.create(projectionSchema)
+                .copy(
+                    MetadataColumns.ROW_ID.name(),
+                    baseRowId + position,
+                    MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                    fileSeqNumber));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnRowLinageExistValue(FileFormat fileFormat) throws IOException {
+    assumeSupports(fileFormat, FEATURE_META_ROW_LINEAGE);
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema dataSchema = dataGenerator.schema();
+
+    Schema writeSchema = MetadataColumns.schemaWithRowLineage(dataSchema);
+
+    List<Record> baseRecords = dataGenerator.generateRecords();
+    List<Record> writeRecords = Lists.newArrayListWithExpectedSize(baseRecords.size());
+    for (int i = 0; i < baseRecords.size(); i++) {
+      Record base = baseRecords.get(i);
+      Record rec = copy(base, dataSchema, writeSchema);
+
+      if (i % 2 == 0) {
+        rec.setField(MetadataColumns.ROW_ID.name(), 555L + i);
+        rec.setField(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(), 7L);
+      } else {
+        rec.setField(MetadataColumns.ROW_ID.name(), null);
+        rec.setField(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(), null);
+      }
+
+      writeRecords.add(rec);
+    }
+
+    DataWriter<Record> writer =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, encryptedFile)
+            .schema(writeSchema)
+            .spec(PartitionSpec.unpartitioned())
+            .build();
+
+    try (writer) {
+      writeRecords.forEach(writer::write);
+    }
+
+    long baseRowId = 100L;
+    long fileSeqNumber = 5L;
+    Schema projectionSchema =
+        new Schema(MetadataColumns.ROW_ID, MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(
+            MetadataColumns.ROW_ID.fieldId(), baseRowId,
+            MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId(), fileSeqNumber);
+
+    // Expected results:
+    // - Even rows (explicit values): _row_id = 555+i, _last_updated_sequence_number = 7
+    // - Odd rows (null values): _row_id = baseRowId+pos, _last_updated_sequence_number =
+    // fileSeqNumber
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        baseRecords,
+        (position, ignored) -> {
+          if (position % 2 == 0) {
+            return GenericRecord.create(projectionSchema)
+                .copy(
+                    MetadataColumns.ROW_ID.name(),
+                    555L + position,
+                    MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                    7L);
+          } else {
+            return GenericRecord.create(projectionSchema)
+                .copy(
+                    MetadataColumns.ROW_ID.name(),
+                    baseRowId + position,
+                    MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                    fileSeqNumber);
+          }
+        });
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnPartitionIdentity(FileFormat fileFormat) throws IOException {
+
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    PartitionSpec spec = PartitionSpec.builderFor(dataGenerator.schema()).identity("col_a").build();
+
+    Types.StructType partitionType = spec.partitionType();
+    PartitionData partitionData = new PartitionData(partitionType);
+    partitionData.set(0, "test_col_a");
+
+    DataWriter<Record> writer =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, encryptedFile)
+            .schema(dataGenerator.schema())
+            .spec(PartitionSpec.unpartitioned())
+            .build();
+
+    List<Record> records = dataGenerator.generateRecords();
+    try (writer) {
+      records.forEach(writer::write);
+    }
+
+    Types.NestedField partitionField =
+        Types.NestedField.optional(
+            MetadataColumns.PARTITION_COLUMN_ID,
+            MetadataColumns.PARTITION_COLUMN_NAME,
+            partitionType,
+            MetadataColumns.PARTITION_COLUMN_DOC);
+    Schema projectionSchema = new Schema(partitionField);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(MetadataColumns.PARTITION_COLUMN_ID, partitionData);
+
+    Record partitionRecord = structLikeToRecord(partitionData, partitionType);
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        records,
+        ignored ->
+            GenericRecord.create(projectionSchema)
+                .copy(MetadataColumns.PARTITION_COLUMN_NAME, partitionRecord));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnPartitionEvolutionAddColumn(FileFormat fileFormat) throws IOException {
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema dataSchema = dataGenerator.schema();
+
+    // Old spec: partition by col_a only (spec id = 0)
+    PartitionSpec oldSpec = PartitionSpec.builderFor(dataSchema).identity("col_a").build();
+
+    // New spec: partition by col_a + col_b (spec id = 1, simulates partition evolution)
+    PartitionSpec newSpec =
+        PartitionSpec.builderFor(dataSchema)
+            .withSpecId(1)
+            .identity("col_a")
+            .identity("col_b")
+            .build();
+
+    // Partition data for the old file (only col_a is set, col_b is absent)
+    PartitionData oldPartitionData = new PartitionData(oldSpec.partitionType());
+    oldPartitionData.set(0, "test_data");
+
+    // Write data using the old spec
+    DataWriter<Record> writer =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, encryptedFile)
+            .schema(dataSchema)
+            .spec(PartitionSpec.unpartitioned())
+            .build();
+
+    List<Record> records = dataGenerator.generateRecords();
+
+    try (writer) {
+      records.forEach(writer::write);
+    }
+
+    Types.StructType unifiedPartitionType = newSpec.partitionType();
+
+    // Build projection schema with PARTITION_COLUMN using the unified partition type
+    Types.NestedField partitionField =
+        Types.NestedField.optional(
+            MetadataColumns.PARTITION_COLUMN_ID,
+            MetadataColumns.PARTITION_COLUMN_NAME,
+            unifiedPartitionType,
+            MetadataColumns.PARTITION_COLUMN_DOC);
+    Schema projectionSchema = new Schema(partitionField);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(MetadataColumns.PARTITION_COLUMN_ID, oldPartitionData);
+
+    Record partitionRecord = structLikeToRecord(oldPartitionData, unifiedPartitionType);
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        records,
+        ignored ->
+            GenericRecord.create(projectionSchema)
+                .copy(MetadataColumns.PARTITION_COLUMN_NAME, partitionRecord));
+  }
+
+  @ParameterizedTest
+  @FieldSource("FILE_FORMATS")
+  void testReadMetadataColumnPartitionEvolutionRemoveColumn(FileFormat fileFormat)
+      throws IOException {
+    DataGenerator dataGenerator = new DataGenerators.DefaultSchema();
+    Schema dataSchema = dataGenerator.schema();
+
+    PartitionSpec oldSpec =
+        PartitionSpec.builderFor(dataSchema).identity("col_a").identity("col_b").build();
+
+    PartitionSpec newSpec =
+        PartitionSpec.builderFor(dataSchema).withSpecId(1).identity("col_a").build();
+
+    // Partition data for the old file (both col_a and col_b are set)
+    PartitionData oldPartitionData = new PartitionData(oldSpec.partitionType());
+    oldPartitionData.set(0, "test_col_a");
+    oldPartitionData.set(1, 1);
+
+    DataWriter<Record> writer =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, encryptedFile)
+            .schema(dataSchema)
+            .spec(PartitionSpec.unpartitioned())
+            .build();
+
+    List<Record> records = dataGenerator.generateRecords();
+
+    try (writer) {
+      records.forEach(writer::write);
+    }
+
+    // Use the new spec's partition type for projection (only col_a remains after evolution)
+    // This simulates reading an old file from the perspective of the new spec
+    Types.StructType newPartitionType = newSpec.partitionType();
+    Types.NestedField partitionField =
+        Types.NestedField.optional(
+            MetadataColumns.PARTITION_COLUMN_ID,
+            MetadataColumns.PARTITION_COLUMN_NAME,
+            newPartitionType,
+            MetadataColumns.PARTITION_COLUMN_DOC);
+    Schema projectionSchema = new Schema(partitionField);
+
+    Map<Integer, Object> idToConstant =
+        ImmutableMap.of(MetadataColumns.PARTITION_COLUMN_ID, oldPartitionData);
+
+    Record partitionRecord = structLikeToRecord(oldPartitionData, newPartitionType);
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        records,
+        ignored ->
+            GenericRecord.create(projectionSchema)
+                .copy(MetadataColumns.PARTITION_COLUMN_NAME, partitionRecord));
+  }
+
+  private void readAndAssertGenericRecords(
+      FileFormat fileFormat,
+      Schema schema,
+      List<Record> sourceRecords,
+      Function<Record, Record> transform)
+      throws IOException {
+    readAndAssertGenericRecords(fileFormat, schema, sourceRecords.stream().map(transform).toList());
+  }
+
   private void readAndAssertGenericRecords(
       FileFormat fileFormat, Schema schema, List<Record> expected) throws IOException {
     InputFile inputFile = encryptedFile.encryptingOutputFile().toInputFile();
@@ -945,20 +1372,6 @@ public abstract class BaseFormatModelTests<T> {
     assertThat(dataFile.format()).isEqualTo(fileFormat);
 
     return dataFile;
-  }
-
-  private List<Record> projectRecords(List<Record> records, Schema projectedSchema) {
-    return records.stream()
-        .map(
-            record -> {
-              Record projected = GenericRecord.create(projectedSchema.asStruct());
-              projectedSchema
-                  .columns()
-                  .forEach(
-                      field -> projected.setField(field.name(), record.getField(field.name())));
-              return projected;
-            })
-        .toList();
   }
 
   private List<T> convertToEngineRecords(List<Record> records, Schema schema) {
@@ -1274,5 +1687,94 @@ public abstract class BaseFormatModelTests<T> {
     assertBounds(fileFormat, intSchema, records, dataFile);
 
     assertThat(dataFile.columnSizes()).isNotNull().isNotEmpty();
+  }
+
+  private Map<Integer, Object> convertConstantsToEngine(
+      Schema projectionSchema, Map<Integer, Object> idToConstant) {
+    return idToConstant.entrySet().stream()
+        .collect(
+            ImmutableMap.toImmutableMap(
+                Map.Entry::getKey,
+                entry ->
+                    convertConstantToEngine(
+                        projectionSchema.findType(entry.getKey()), entry.getValue())));
+  }
+
+  private static Record structLikeToRecord(StructLike structLike, Types.StructType structType) {
+    Record record = GenericRecord.create(structType);
+    int sourceSize = structLike.size();
+    for (int i = 0; i < structType.fields().size(); i++) {
+      if (i < sourceSize) {
+        record.set(i, structLike.get(i, Object.class));
+      } else {
+        Types.NestedField field = structType.fields().get(i);
+        record.set(i, field.initialDefault());
+      }
+    }
+
+    return record;
+  }
+
+  private void readAndAssertMetadataColumn(
+      FileFormat fileFormat,
+      Schema projectionSchema,
+      Map<Integer, Object> idToConstant,
+      List<Record> sourceRecords,
+      Function<Record, Record> transform)
+      throws IOException {
+    readAndAssertMetadataColumn(
+        fileFormat, projectionSchema, idToConstant, sourceRecords.stream().map(transform).toList());
+  }
+
+  private void readAndAssertMetadataColumn(
+      FileFormat fileFormat,
+      Schema projectionSchema,
+      Map<Integer, Object> idToConstant,
+      List<Record> sourceRecords,
+      BiFunction<Integer, Record, Record> transform)
+      throws IOException {
+    readAndAssertMetadataColumn(
+        fileFormat,
+        projectionSchema,
+        idToConstant,
+        IntStream.range(0, sourceRecords.size())
+            .mapToObj(index -> transform.apply(index, sourceRecords.get(index)))
+            .toList());
+  }
+
+  private void readAndAssertMetadataColumn(
+      FileFormat fileFormat,
+      Schema projectionSchema,
+      Map<Integer, Object> idToConstant,
+      List<Record> expectedRecords)
+      throws IOException {
+
+    InputFile inputFile = encryptedFile.encryptingOutputFile().toInputFile();
+    List<T> readRecords;
+
+    var readerBuilder =
+        FormatModelRegistry.readBuilder(fileFormat, engineType(), inputFile)
+            .project(projectionSchema);
+
+    if (idToConstant != null) {
+      readerBuilder.idToConstant(convertConstantsToEngine(projectionSchema, idToConstant));
+    }
+
+    try (CloseableIterable<T> reader = readerBuilder.build()) {
+      readRecords = ImmutableList.copyOf(reader);
+    }
+
+    assertThat(readRecords).hasSize(expectedRecords.size());
+    assertEquals(
+        projectionSchema, convertToEngineRecords(expectedRecords, projectionSchema), readRecords);
+  }
+
+  private static Record copy(Record source, Schema sourceSchema, Schema targetSchema) {
+    Record result = GenericRecord.create(targetSchema);
+    for (Types.NestedField col : sourceSchema.columns()) {
+      result.setField(col.name(), source.getField(col.name()));
+    }
+
+    return result;
   }
 }
