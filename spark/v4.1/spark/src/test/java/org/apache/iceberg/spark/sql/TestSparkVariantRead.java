@@ -337,16 +337,16 @@ public class TestSparkVariantRead extends TestBase {
         new Variant(
             ((VariantVal) rows.get(0).get(1)).getValue(),
             ((VariantVal) rows.get(0).get(1)).getMetadata());
-    assertThat(v1.getFieldByKey("name").getString()).isEqualTo("alice");
-    assertThat(v1.getFieldByKey("age").getLong()).isEqualTo(31L);
+    assertThat(v1.getFieldByKey("name").getString()).describedAs("v1.name").isEqualTo("alice");
+    assertThat(v1.getFieldByKey("age").getLong()).describedAs("v1.age").isEqualTo(31L);
 
     assertThat(rows.get(1).getLong(0)).isEqualTo(2L);
     Variant v2 =
         new Variant(
             ((VariantVal) rows.get(1).get(1)).getValue(),
             ((VariantVal) rows.get(1).get(1)).getMetadata());
-    assertThat(v2.getFieldByKey("name").getString()).isEqualTo("bob");
-    assertThat(v2.getFieldByKey("age").getLong()).isEqualTo(25L);
+    assertThat(v2.getFieldByKey("name").getString()).describedAs("v2.name").isEqualTo("bob");
+    assertThat(v2.getFieldByKey("age").getLong()).describedAs("v2.age").isEqualTo(25L);
 
     sql("DROP TABLE IF EXISTS %s", mergeTable);
   }
