@@ -21,7 +21,9 @@ package org.apache.iceberg.parquet;
 import java.math.BigDecimal;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import org.apache.iceberg.Schema;
@@ -40,6 +42,8 @@ import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Types;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Analyzes variant data across buffered rows to determine an optimal shredding schema.
@@ -72,6 +76,7 @@ import org.apache.parquet.schema.Types;
  * @param <S> the engine-specific schema type (e.g., Spark StructType, Flink RowType)
  */
 public abstract class VariantShreddingAnalyzer<T, S> {
+  private static final Logger LOG = LoggerFactory.getLogger(VariantShreddingAnalyzer.class);
   private static final String TYPED_VALUE = "typed_value";
   private static final String VALUE = "value";
   private static final String ELEMENT = "element";
@@ -79,8 +84,64 @@ public abstract class VariantShreddingAnalyzer<T, S> {
   private static final int MAX_SHREDDED_FIELDS = 300;
   private static final int MAX_SHREDDING_DEPTH = 50;
   private static final int MAX_INTERMEDIATE_FIELDS = 1000;
+  private static final double WILSON_Z_95 = 1.96;
+  private static final double WILSON_MIN_UNIFORM_FRACTION =
+      Double.parseDouble(System.getProperty("bench.variant.shred.wilson-threshold", "0.90"));
+  // Ryan Blue, 2026-06-04 community sync: "If we sample 20 rows and they're entirely uniform,
+  // just go with it." B5_FIRST_20_UNIFORM samples this many rows then requires every shredded
+  // field to be present and type-uniform across all of them.
+  private static final int B5_INITIAL_SAMPLE_SIZE =
+      Integer.parseInt(System.getProperty("bench.variant.shred.b5-sample-size", "20"));
 
-  protected VariantShreddingAnalyzer() {}
+  /**
+   * Inference strategy for selecting which paths to shred and which type to assign to each.
+   *
+   * <p>B1_MAJORITY is the current apache/main behavior (PR #14297): majority-type wins with
+   * deterministic tie-break. V2_UNIFORM additionally requires type-uniformity (a path with any
+   * minority type is not shredded).
+   *
+   * <p>B4_FIRST_ROW and B5_FIRST_20_UNIFORM are the strawman strategies Ryan Blue proposed in the
+   * 2026-06-04 Variant community sync: B4 uses only the schema of the first row (the most extreme
+   * cheap inference); B5 samples the first 20 rows and accepts a field only if it is type-uniform
+   * across all 20. Both exist in the matrix as data-driven defenses against the "why not just do
+   * the trivial thing?" question.
+   */
+  public enum InferenceStrategy {
+    B1_MAJORITY,
+    B4_FIRST_ROW,
+    B5_FIRST_20_UNIFORM,
+    V2_UNIFORM,
+    V2_UNIFORM_WILSON;
+
+    public static InferenceStrategy fromProperty(String value) {
+      if (value == null) {
+        return B1_MAJORITY;
+      }
+      String normalized = value.toLowerCase(Locale.ROOT);
+      return switch (normalized) {
+        case "b1-majority", "majority" -> B1_MAJORITY;
+        case "b4-first-row", "first-row" -> B4_FIRST_ROW;
+        case "b5-first-20-uniform", "first-20-uniform" -> B5_FIRST_20_UNIFORM;
+        case "v2-uniform", "uniform" -> V2_UNIFORM;
+        case "v2-uniform-wilson", "uniform-wilson" -> V2_UNIFORM_WILSON;
+        default -> throw new IllegalArgumentException("Unknown inference strategy: " + value);
+      };
+    }
+  }
+
+  private final InferenceStrategy strategy;
+
+  protected VariantShreddingAnalyzer() {
+    this(InferenceStrategy.B1_MAJORITY);
+  }
+
+  protected VariantShreddingAnalyzer(InferenceStrategy strategy) {
+    this.strategy = strategy;
+  }
+
+  protected InferenceStrategy strategy() {
+    return strategy;
+  }
 
   /**
    * Analyzes buffered variant values to determine the optimal shredding schema.
@@ -91,6 +152,8 @@ public abstract class VariantShreddingAnalyzer<T, S> {
    */
   public Type analyzeAndCreateSchema(List<T> bufferedRows, int variantFieldIndex) {
     List<VariantValue> variantValues = extractVariantValues(bufferedRows, variantFieldIndex);
+    LOG.info(
+        "VariantShreddingAnalyzer buffered rows={} strategy={}", variantValues.size(), strategy);
     if (variantValues.isEmpty()) {
       return null;
     }
@@ -142,31 +205,35 @@ public abstract class VariantShreddingAnalyzer<T, S> {
     return shreddedTypes;
   }
 
-  private static PathNode buildPathTree(List<VariantValue> variantValues) {
+  private PathNode buildPathTree(List<VariantValue> variantValues) {
     PathNode root = new PathNode(null);
     root.info = new FieldInfo();
 
-    for (VariantValue value : variantValues) {
-      traverse(root, value, 0);
+    int rowsToSample = sampleSize(variantValues.size());
+    for (int rowId = 0; rowId < rowsToSample; rowId++) {
+      traverse(root, variantValues.get(rowId), 0, rowId);
     }
 
     return root;
   }
 
-  private static void pruneInfrequentFields(PathNode node, int totalRows) {
+  // Sample-size strategies (B4, B5) bound the number of rows fed into the path tree. Other
+  // strategies walk every value.
+  private int sampleSize(int totalRows) {
+    return switch (strategy) {
+      case B4_FIRST_ROW -> Math.min(1, totalRows);
+      case B5_FIRST_20_UNIFORM -> Math.min(B5_INITIAL_SAMPLE_SIZE, totalRows);
+      default -> totalRows;
+    };
+  }
+
+  private void pruneInfrequentFields(PathNode node, int totalRows) {
     if (node.objectChildren.isEmpty() && node.arrayElement == null) {
       return;
     }
 
-    // Remove fields below frequency threshold
-    node.objectChildren
-        .entrySet()
-        .removeIf(
-            entry -> {
-              FieldInfo info = entry.getValue().info;
-              return info != null
-                  && ((double) info.observationCount / totalRows) < MIN_FIELD_FREQUENCY;
-            });
+    // Remove fields the active strategy rejects
+    node.objectChildren.entrySet().removeIf(entry -> shouldPrune(entry.getValue().info, totalRows));
 
     // Cap at MAX_SHREDDED_FIELDS, keep the most frequently observed
     if (node.objectChildren.size() > MAX_SHREDDED_FIELDS) {
@@ -202,21 +269,91 @@ public abstract class VariantShreddingAnalyzer<T, S> {
     }
   }
 
-  private static void traverse(PathNode node, VariantValue value, int depth) {
+  private boolean shouldPrune(FieldInfo info, int totalRows) {
+    if (info == null) {
+      return false;
+    }
+    return switch (strategy) {
+      case B1_MAJORITY -> ((double) info.observationCount / totalRows) < MIN_FIELD_FREQUENCY;
+      case B4_FIRST_ROW ->
+          // Sample of 1: any field that exists in the tree was observed in row 0 by construction.
+          // No pruning. The single-row sample is the schema.
+          false;
+      case B5_FIRST_20_UNIFORM -> {
+        // Field must be present in EVERY sampled row AND type-uniform across those rows.
+        // totalRows here is the sampled row count (set by buildPathTree's sampleSize cap).
+        if (info.rowsContainingPath < totalRows) {
+          yield true;
+        }
+        yield info.getUniformType().isEmpty();
+      }
+      case V2_UNIFORM -> {
+        double freq = (double) info.rowsContainingPath / totalRows;
+        if (freq < MIN_FIELD_FREQUENCY) {
+          yield true;
+        }
+        yield info.getUniformType().isEmpty();
+      }
+      case V2_UNIFORM_WILSON -> {
+        double freq = (double) info.rowsContainingPath / totalRows;
+        if (freq < MIN_FIELD_FREQUENCY) {
+          yield true;
+        }
+        PhysicalType dominant = info.getMostCommonType();
+        if (dominant == null) {
+          yield true;
+        }
+        double pLower = wilsonLowerBound(info.getMostCommonCount(), info.observationCount);
+        yield pLower < WILSON_MIN_UNIFORM_FRACTION;
+      }
+    };
+  }
+
+  /**
+   * Wilson score lower bound for a Bernoulli proportion at 95% confidence. Used by
+   * V2_UNIFORM_WILSON to admit shredding when the fraction of observations matching the dominant
+   * type is statistically very high (default >= 0.99). Softens V2_UNIFORM's all-or-nothing rule for
+   * noisy real-world data while keeping a bound on the minority slice.
+   *
+   * <p>Formula: p_lower = (p + z^2/(2n) - z * sqrt(p(1-p)/n + z^2/(4n^2))) / (1 + z^2/n) where p =
+   * matching/total, n = total, z = 1.96 for 95% confidence.
+   */
+  private static double wilsonLowerBound(int matching, int total) {
+    if (total <= 0) {
+      return 0.0;
+    }
+    double proportion = (double) matching / total;
+    double z2 = WILSON_Z_95 * WILSON_Z_95;
+    double nDouble = total;
+    double denominator = 1.0 + z2 / nDouble;
+    double center = proportion + z2 / (2 * nDouble);
+    double margin =
+        WILSON_Z_95
+            * Math.sqrt((proportion * (1 - proportion)) / nDouble + z2 / (4 * nDouble * nDouble));
+    return (center - margin) / denominator;
+  }
+
+  private void traverse(PathNode node, VariantValue value, int depth, long rowId) {
     if (value == null || value.type() == PhysicalType.NULL) {
       return;
     }
 
-    node.info.observe(value);
+    if (strategy == InferenceStrategy.B1_MAJORITY) {
+      // B1 preserves apache/main per-element accounting byte-identically.
+      node.info.observe(value);
+    } else {
+      // B4, B5, V2_UNIFORM all use per-row accounting.
+      node.info.observe(value, rowId);
+    }
 
     if (value.type() == PhysicalType.OBJECT && depth < MAX_SHREDDING_DEPTH) {
-      traverseObject(node, value.asObject(), depth);
+      traverseObject(node, value.asObject(), depth, rowId);
     } else if (value.type() == PhysicalType.ARRAY && depth < MAX_SHREDDING_DEPTH) {
-      traverseArray(node, value.asArray(), depth);
+      traverseArray(node, value.asArray(), depth, rowId);
     }
   }
 
-  private static void traverseObject(PathNode node, VariantObject obj, int depth) {
+  private void traverseObject(PathNode node, VariantObject obj, int depth, long rowId) {
     for (String fieldName : obj.fieldNames()) {
       VariantValue fieldValue = obj.get(fieldName);
       if (fieldValue != null) {
@@ -229,14 +366,15 @@ public abstract class VariantShreddingAnalyzer<T, S> {
           childNode.info = new FieldInfo();
           node.objectChildren.put(fieldName, childNode);
         }
-        traverse(childNode, fieldValue, depth + 1);
+        traverse(childNode, fieldValue, depth + 1, rowId);
       }
     }
   }
 
   // observationCount inside arrays counts per-element, not per-row, so fields in long arrays
-  // have inflated frequency and resist pruning.
-  private static void traverseArray(PathNode node, VariantArray array, int depth) {
+  // have inflated frequency and resist pruning. V2-* strategies fix this by counting via
+  // rowsContainingPath through the rowId-aware observe overload.
+  private void traverseArray(PathNode node, VariantArray array, int depth, long rowId) {
     int numElements = array.numElements();
     if (node.arrayElement == null) {
       node.arrayElement = new PathNode(null);
@@ -245,7 +383,7 @@ public abstract class VariantShreddingAnalyzer<T, S> {
     for (int i = 0; i < numElements; i++) {
       VariantValue element = array.get(i);
       if (element != null) {
-        traverse(node.arrayElement, element, depth + 1);
+        traverse(node.arrayElement, element, depth + 1, rowId);
       }
     }
   }
@@ -425,8 +563,11 @@ public abstract class VariantShreddingAnalyzer<T, S> {
     private int maxDecimalScale = 0;
     private int maxDecimalIntegerDigits = 0;
     private int observationCount = 0;
+    private int rowsContainingPath = 0;
+    private long lastSeenRowId = -1L;
     private boolean mostCommonComputed = false;
     private PhysicalType mostCommonCached = null;
+    private int mostCommonCachedCount = 0;
 
     private static final Map<PhysicalType, Integer> INTEGER_PRIORITY =
         ImmutableMap.of(
@@ -483,6 +624,69 @@ public abstract class VariantShreddingAnalyzer<T, S> {
       }
     }
 
+    /**
+     * Per-row observation overload used by V2-* strategies. Increments {@code rowsContainingPath}
+     * once per distinct {@code rowId}, fixing the per-element inflation that B1_MAJORITY inherits
+     * for paths reached through arrays.
+     */
+    void observe(VariantValue value, long rowId) {
+      observe(value);
+      if (rowId != lastSeenRowId) {
+        rowsContainingPath++;
+        lastSeenRowId = rowId;
+      }
+    }
+
+    /**
+     * Returns the single physical type all observations share, treating integer and decimal
+     * families as widened to their most capable member. Empty when observations span more than one
+     * family (the V2_UNIFORM rejection condition).
+     */
+    Optional<PhysicalType> getUniformType() {
+      // Inline family-widening to avoid coupling with getMostCommonType (per project convention:
+      // do not extract shared helpers between B1 and V2-* code paths).
+      Map<PhysicalType, Integer> combined = Maps.newHashMap();
+      int integerTotalCount = 0;
+      PhysicalType mostCapableInteger = null;
+      int decimalTotalCount = 0;
+      PhysicalType mostCapableDecimal = null;
+
+      for (int i = 0; i < typeCounts.length; i++) {
+        int count = typeCounts[i];
+        if (count == 0) {
+          continue;
+        }
+        PhysicalType type = PHYSICAL_TYPES[i];
+        if (isIntegerType(type)) {
+          integerTotalCount += count;
+          if (mostCapableInteger == null
+              || INTEGER_PRIORITY.get(type) > INTEGER_PRIORITY.get(mostCapableInteger)) {
+            mostCapableInteger = type;
+          }
+        } else if (isDecimalType(type)) {
+          decimalTotalCount += count;
+          if (mostCapableDecimal == null
+              || DECIMAL_PRIORITY.get(type) > DECIMAL_PRIORITY.get(mostCapableDecimal)) {
+            mostCapableDecimal = type;
+          }
+        } else {
+          combined.put(type, count);
+        }
+      }
+
+      if (mostCapableInteger != null) {
+        combined.put(mostCapableInteger, integerTotalCount);
+      }
+      if (mostCapableDecimal != null) {
+        combined.put(mostCapableDecimal, decimalTotalCount);
+      }
+
+      if (combined.size() != 1) {
+        return Optional.empty();
+      }
+      return combined.keySet().stream().findFirst();
+    }
+
     PhysicalType getMostCommonType() {
       if (mostCommonComputed) {
         return mostCommonCached;
@@ -529,16 +733,23 @@ public abstract class VariantShreddingAnalyzer<T, S> {
       }
 
       // Pick the most common type with tie-breaking
-      mostCommonCached =
+      Optional<Map.Entry<PhysicalType, Integer>> winner =
           combinedCounts.entrySet().stream()
               .max(
                   Map.Entry.<PhysicalType, Integer>comparingByValue()
                       .thenComparingInt(
-                          entry -> TIE_BREAK_PRIORITY.getOrDefault(entry.getKey(), -1)))
-              .map(Map.Entry::getKey)
-              .orElse(null);
+                          entry -> TIE_BREAK_PRIORITY.getOrDefault(entry.getKey(), -1)));
+      mostCommonCached = winner.map(Map.Entry::getKey).orElse(null);
+      mostCommonCachedCount = winner.map(Map.Entry::getValue).orElse(0);
       mostCommonComputed = true;
       return mostCommonCached;
+    }
+
+    int getMostCommonCount() {
+      if (!mostCommonComputed) {
+        getMostCommonType();
+      }
+      return mostCommonCachedCount;
     }
 
     private static boolean isIntegerType(PhysicalType type) {
